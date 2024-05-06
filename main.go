@@ -3,99 +3,53 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
+	"time"
 )
 
-var (
-	exeCache     = make(map[string]map[string]string)
-	addr2lineCn  int
-	cache2lineCn int
-)
+var blockEnd = Str2Bytes("]:")
 
-var sample = make(map[string]int)
-
-func Addr2line(exe, address string) ([]byte, error) {
+func flamegraph(folded *bytes.Buffer, svg string) error {
+	stdout, err := os.OpenFile(svg, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "can't open file \"%s\":%s\n", svg, err.Error())
+		return err
+	}
+	defer func() {
+		_ = stdout.Close()
+	}()
 	var stderr bytes.Buffer
-	var stdout bytes.Buffer
-	//addr2line -e /opt/WiseGrid/api/bin/smartapi -f -i -s  -C  0x71e277
-	cmd := exec.Command("addr2line", "-e", exe, "-f", "-i", "-s", "-C", address)
-	cmd.Stdout = &stdout
+	cmd := exec.Command("/opt/FlameGraph/flamegraph.pl")
+	cmd.Dir = filepath.Dir(svg)
+	cmd.Stdin = folded
+	cmd.Stdout = stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if stderr.Len() > 0 {
-			return []byte{}, fmt.Errorf("%s:%s", err.Error(), stderr.String())
+			return fmt.Errorf("%s:%s", err.Error(), stderr.String())
 
 		} else {
-			return []byte{}, err
+			return err
 		}
 	}
-	return stdout.Bytes(), nil
+	return nil
 }
 
-func Addr2FuncName(exe, address string) (string, error) {
-	out, err := Addr2line(exe, address)
-	if err != nil {
-		return "", err
-	}
-	br := bufio.NewReader(bytes.NewReader(out))
-	for {
-		line, _, err := br.ReadLine()
-		if err == io.EOF {
-			break
-
-		} else if err != nil {
-			return "", err
-		}
-		return Bytes2Str(line), nil
-	}
-	return "", fmt.Errorf("not found")
-}
-
-func GetFuncName(exe, address string) (string, error) {
-	addressCache, ok := exeCache[exe]
-	if !ok {
-		addressCache = make(map[string]string)
-		exeCache[exe] = addressCache
-	}
-	funcName, ok := addressCache[address]
-	if ok {
-		cache2lineCn++
-		return funcName, nil
-	}
-
-	funcName, err := Addr2FuncName(exe, address)
-	if err != nil {
-		return "", err
-	}
-
-	addressCache[address] = funcName
-	addr2lineCn++
-	return funcName, nil
-}
-
-func RenderSample(stack []string) {
-	if len(stack) > 1 {
-		for i := 0; i < len(stack)/2; i++ {
-			stack[i], stack[len(stack)-1-i] = stack[len(stack)-1-i], stack[i]
-		}
-	}
+func RenderSample(stack []string, cost int) string {
+	slices.Reverse(stack)
 	key := strings.Join(stack, ";")
-	cn, ok := sample[key]
-	if !ok {
-		cn = 1
-
-	} else {
-		cn++
-	}
-	sample[key] = cn
+	return fmt.Sprintf("%s %d\n", key, cost)
 }
 
 func ToFlameInput(f string) error {
+	var in bytes.Buffer
 	file, err := os.Open(f)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "can't open file:%s\n", err.Error())
@@ -106,8 +60,11 @@ func ToFlameInput(f string) error {
 	}()
 
 	var stack []string
+	var state bool
 	var cn int
 	var l int
+	var stackcn int
+	var allCost int
 	br := bufio.NewReader(file)
 	for {
 		line, _, err := br.ReadLine()
@@ -119,75 +76,57 @@ func ToFlameInput(f string) error {
 			return err
 		}
 		l++
-		data := Bytes2Str(line)
-		if !strings.Contains(data, "SYMBOL layer") {
-			continue
+		data := bytes.TrimSpace(line)
+		if !state {
+			if Bytes2Str(data) == "@[" {
+				stackcn++
+				state = true
+				stack = stack[:0]
+				//stack = append(stack, "system")
+			}
+
+		} else if bytes.HasPrefix(data, blockEnd) {
+			data = bytes.TrimSpace(bytes.TrimPrefix(data, blockEnd))
+			//栈结束了输出一条记录
+			if cost, err := strconv.Atoi(Bytes2Str(data)); err == nil {
+				in.WriteString(RenderSample(stack, cost))
+				cn++
+				allCost += cost
+
+			} else {
+				_, _ = fmt.Fprintf(os.Stderr, "l = %d:%s\n", l, err.Error())
+			}
+			state = false
+
+		} else if len(data) > 0 {
+			//将记录保存到栈中
+			if index := bytes.Index(data, Str2Bytes("+")); index >= 0 {
+				data = data[0:index]
+			}
+			stack = append(stack, string(data))
 		}
-
-		fileds := strings.Fields(data)
-		if len(fileds) != 9 {
-			err = fmt.Errorf("stack format error")
-			_, _ = fmt.Fprintf(os.Stderr, "line %d %s\n", l, err.Error())
-			return err
-		}
-
-		index := fileds[6]
-		if index = strings.TrimSuffix(index, ":"); index == "0" && len(stack) > 0 {
-			RenderSample(stack)
-			cn++
-			stack = stack[:0]
-		}
-
-		exe := fileds[7]
-		if j := strings.IndexByte(exe, '('); j >= 0 {
-			exe = exe[0:j]
-		}
-
-		address := fileds[8]
-		address = strings.TrimPrefix(strings.TrimSuffix(address, "]"), "[")
-
-		funcName, err := GetFuncName(exe, address)
-		if err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "line %d %s\n", l, err.Error())
-			return err
-		}
-
-		stack = append(stack, funcName)
 	}
-	if len(stack) <= 0 {
+	if cn <= 0 {
 		err = fmt.Errorf("too few stacks")
 		_, _ = fmt.Fprintf(os.Stderr, "%s\n", err.Error())
 		return err
 	}
-	RenderSample(stack)
-	cn++
-
-	_, _ = fmt.Fprintf(os.Stderr, "stack number = %d\n", cn)
-	_, _ = fmt.Fprintf(os.Stderr, "sample number= %d\n", len(sample))
-	_, _ = fmt.Fprintf(os.Stderr, "addr2lineCn  = %d\n", addr2lineCn)
-	_, _ = fmt.Fprintf(os.Stderr, "cache2lineCn = %d\n", cache2lineCn)
-
-	for k, v := range sample {
-		if one {
-			v = 1
-		}
-		fmt.Printf("%s %d\n", k, v)
+	if err := flamegraph(&in, DeleteExt(f)+".svg"); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "%s\n", err.Error())
+		return err
 	}
-
+	fmt.Printf("line               = %d\n", l)
+	fmt.Printf("stack number       = %d\n", stackcn)
+	fmt.Printf("flame stack number = %d\n", cn)
+	fmt.Printf("all cost           = %v\n", time.Duration(allCost))
 	return nil
 }
 
-var one bool
-
 // 过滤进程号、过滤行号
 func main() {
-	flag.BoolVar(&one, "one", false, "one")
-	flag.Parse()
-
-	args := flag.Args()
-	if len(args) <= 0 {
-		os.Exit(1)
+	if len(os.Args) < 2 {
+		_, _ = fmt.Fprintf(os.Stderr, "usage: bpftrace_stack file\n")
 		return
 	}
-	_ = ToFlameInput(args[0])
+	_ = ToFlameInput(os.Args[1])
 }

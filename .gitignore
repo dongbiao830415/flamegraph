@@ -1,4 +1,5 @@
 .idea
 *.exe
 *.log
-aaaa
+bpftrace_to_flamegraph
+*.txt
