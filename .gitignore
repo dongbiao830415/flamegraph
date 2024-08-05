@@ -1,5 +1,6 @@
 .idea
 *.exe
 *.log
-bpftrace_to_flamegraph
 *.txt
+backtrace
+bpftrace

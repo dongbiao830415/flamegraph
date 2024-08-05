@@ -1,3 +1,3 @@
-module github.com/dongbiao830415/bpftrace_to_flamegraph
+module github.com/dongbiao830415/flamegraph
 
 go 1.22
