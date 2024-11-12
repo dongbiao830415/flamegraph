@@ -4,3 +4,6 @@
 *.txt
 backtrace
 bpftrace
+memleak
+*.svg
+*.png

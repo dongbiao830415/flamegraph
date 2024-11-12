@@ -104,19 +104,20 @@ var isSkip = false
 
 func parseBacktrace(data []byte) (string, error) {
 	fileds := bytes.Fields(data)
-	if len(fileds) != 8 {
+	if len(fileds) != 9 {
 		err := fmt.Errorf("stack format error")
 		_, _ = fmt.Fprintf(os.Stderr, "backtrace format error at %d:%s\n", l, err.Error())
 		return "", err
 	}
 
-	exe := fileds[6]
+	exe := fileds[7]
 	if j := bytes.IndexByte(exe, '('); j >= 0 {
 		exe = exe[0:j]
 	}
 
 	if bytes.Contains(exe, util.Str2Bytes("hook.so")) ||
-		bytes.Contains(exe, util.Str2Bytes("libmariadb.so")) {
+		bytes.Contains(exe, util.Str2Bytes("libmariadb.so")) ||
+		bytes.Contains(exe, util.Str2Bytes("libmicrohttpd.so")) {
 		isSkip = true
 		return "", fmt.Errorf("skip")
 
@@ -124,7 +125,7 @@ func parseBacktrace(data []byte) (string, error) {
 		exe = util.Str2Bytes("/opt/WiseGrid/shell/smartctrl")
 	}
 
-	address := fileds[7]
+	address := fileds[8]
 	address = bytes.TrimPrefix(bytes.TrimSuffix(address, util.Str2Bytes("]")), util.Str2Bytes("["))
 	addr := string(address)
 

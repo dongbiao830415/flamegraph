@@ -10,6 +10,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include <poll.h>
+#include <pthread.h>
 
 
 #define MAX_FRAMES (100)
@@ -21,6 +22,70 @@
 static char   *g_log      = NULL;
 static size_t  g_log_size = 2048;
 
+/////////////////////////////////////////////////
+#define ONCE_INIT() {0, PTHREAD_MUTEX_INITIALIZER}
+
+
+typedef int32_t (*once_func)(void *data);
+
+typedef struct {
+    int32_t          done;
+    pthread_mutex_t  lock;
+} once_t;
+
+
+static inline int32_t
+once_init(once_t *once)
+{
+    int32_t rc;
+
+    once->done = 0;
+    rc = pthread_mutex_init(&once->lock, NULL);
+    if (0 != rc) {
+        return -1;
+    }
+    return 0;
+}
+
+static int32_t
+once_do_slow(once_t *once, once_func func, void *data)
+{
+    int32_t value = 1;
+    int32_t rc = 0;
+
+    pthread_mutex_lock(&once->lock);
+    if (once->done == 0) {
+        rc = func(data);
+        if (rc != 0) {
+            pthread_mutex_unlock(&once->lock);
+            return rc;
+        }
+        __atomic_store(&once->done, &value, __ATOMIC_SEQ_CST);
+    }
+    pthread_mutex_unlock(&once->lock);
+
+    return rc;
+}
+
+static inline int32_t
+once_do(once_t *once, once_func func, void *data)
+{
+    int32_t value;
+
+    __atomic_load(&once->done, &value, __ATOMIC_SEQ_CST);
+    if (value != 0) {
+        return 0;
+    }
+    return once_do_slow(once, func, data);
+}
+
+static inline void
+once_free(once_t *once)
+{
+    once->done = 0;
+    pthread_mutex_destroy(&once->lock);
+}
+/////////////////////////////////////
 
 static void
 debug_log_info1(const char *log_file, const char *file, int32_t line, const char *format, ...)
@@ -86,7 +151,7 @@ failed:
 }
 
 static void
-print_callers()
+print_callers(int64_t value)
 {
     char   **symbols = NULL;
     void    *frames[MAX_FRAMES];
@@ -95,16 +160,18 @@ print_callers()
     memset(frames, 0, sizeof(frames));
     layers = backtrace(frames, MAX_FRAMES);
 
+    debug_log_info("@[");
     symbols = backtrace_symbols(frames, layers);
     if (symbols) {
         for (i=0; i<layers; i++) {
-            debug_log_info("hook %d: %s", i, symbols[i]);
+            debug_log_info("SYMBOL layer %d: %s", i, symbols[i]);
         }
         free(symbols);
 
     } else {
         debug_log_info("Failed to parse function names");
     }
+    debug_log_info("]: %ld", value);
 }
 
 static inline int64_t
@@ -136,7 +203,6 @@ int system(const char *cmd)
     }
     return old_system(cmd);
 }
-#endif
 
 //extern int poll (struct pollfd *__fds, nfds_t __nfds, int __timeout);
 
@@ -159,10 +225,46 @@ int poll(struct pollfd *__fds, nfds_t __nfds, int __timeout)
     rc = old_poll(__fds, __nfds, __timeout);
     end = get_microsecond();
 
-
-    debug_log_info("@[");
-    print_callers();
-    debug_log_info("]: %ld", end - start);
+    print_callers(end - start);
 
     return rc;
 }
+#endif
+
+static once_t g_once = ONCE_INIT();
+
+
+static void      *handle_libc = NULL;
+
+
+typedef int(*HOOK_OPEN)(const char *__file, int __oflag, ...);
+
+
+static HOOK_OPEN  open_old = NULL;
+
+
+static int32_t
+get_handle(void *data)
+{
+    handle_libc = dlopen("libc.so.6", RTLD_LAZY);
+    open_old = (HOOK_OPEN)dlsym(handle_libc, "open");
+    return 0;
+}
+
+int open (const char *__file, int __oflag, ...)
+{
+    int32_t rc;
+    va_list ap;
+
+    once_do(&g_once, get_handle, NULL);
+
+
+    va_start(ap, __oflag);
+    rc = open_old(__file, __oflag, ap);
+    va_end(ap);
+
+    print_callers(1);
+
+    return rc;
+}
+
