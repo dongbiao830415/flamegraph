@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -17,7 +16,24 @@ import (
 )
 
 var (
-	exeCache     = make(map[string]map[string]string)
+	display bool
+	one     bool
+)
+
+type Local struct {
+	FuncName string
+	FileLine string
+}
+
+func (l *Local) String() string {
+	if !display || l.FileLine == "" {
+		return l.FuncName
+	}
+	return fmt.Sprintf("%s at %s", l.FuncName, l.FileLine)
+}
+
+var (
+	exeCache     = make(map[string]map[string]Local)
 	addr2lineCn  int
 	cache2lineCn int
 )
@@ -30,7 +46,16 @@ func Addr2line(exe, address string) ([]byte, error) {
 	var stderr bytes.Buffer
 	var stdout bytes.Buffer
 	//addr2line -e /opt/WiseGrid/api/bin/smartapi -f -i -s  -C  0x71e277
-	cmd := exec.Command("addr2line", "-e", exe, "-f", "-i", "-s", "-C", address)
+	args := []string{
+		"-e", exe,
+		"-f",
+		"-i",
+		"-s",
+		"-C",
+		"-p",
+		address,
+	}
+	cmd := exec.Command("addr2line", args...)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -58,37 +83,50 @@ func Addr2FuncName(exe, address string) (string, error) {
 		} else if err != nil {
 			return "", err
 		}
-		return util.Bytes2Str(line), nil
+		return string(line), nil
 	}
 	return "", fmt.Errorf("not found")
 }
 
-func GetFuncName(exe, address string) (string, error) {
+func GetFuncName(exe, address string) Local {
 	addressCache, ok := exeCache[exe]
 	if !ok {
-		addressCache = make(map[string]string)
+		addressCache = make(map[string]Local)
 		exeCache[exe] = addressCache
 	}
-	funcName, ok := addressCache[address]
+	local, ok := addressCache[address]
 	if ok {
 		cache2lineCn++
-		return funcName, nil
+		return local
 	}
 
-	funcName, err := Addr2FuncName(exe, address)
+	data, err := Addr2FuncName(exe, address)
 	if err != nil {
-		return address, nil
+		return Local{FuncName: address}
 	}
+	field := strings.Split(data, " at ")
+	if len(field) != 2 {
+		return Local{FuncName: address}
+	}
+	local = Local{FuncName: field[0], FileLine: field[1]}
+	addressCache[address] = local
 
-	addressCache[address] = funcName
 	addr2lineCn++
-	return funcName, nil
+	return local
 }
 
 // RenderSample 累计
-func RenderSample(stack []string, cost int) {
-	slices.Reverse(stack)
-	key := strings.Join(stack, ";")
+func RenderSample(stack []Local, cost int) {
+	for i := 0; i < len(stack)-1; i++ {
+		stack[i].FileLine = stack[i+1].FileLine
+	}
+	stack[len(stack)-1].FileLine = ""
+
+	stackStr := make([]string, 0, len(stack))
+	for i := len(stack) - 1; i >= 0; i-- {
+		stackStr = append(stackStr, stack[i].String())
+	}
+	key := strings.Join(stackStr, ";")
 	allCost, ok := sample[key]
 	if !ok {
 		allCost = cost
@@ -102,15 +140,15 @@ func RenderSample(stack []string, cost int) {
 var l int
 var isSkip = false
 
-func parseBacktrace(data []byte) (string, error) {
+func parseBacktrace(data []byte) (Local, error) {
 	fileds := bytes.Fields(data)
-	if len(fileds) != 9 {
+	if len(fileds) != 10 {
 		err := fmt.Errorf("stack format error")
 		_, _ = fmt.Fprintf(os.Stderr, "backtrace format error at %d:%s\n", l, err.Error())
-		return "", err
+		return Local{}, err
 	}
 
-	exe := fileds[7]
+	exe := fileds[8]
 	if j := bytes.IndexByte(exe, '('); j >= 0 {
 		exe = exe[0:j]
 	}
@@ -119,23 +157,17 @@ func parseBacktrace(data []byte) (string, error) {
 		bytes.Contains(exe, util.Str2Bytes("libmariadb.so")) ||
 		bytes.Contains(exe, util.Str2Bytes("libmicrohttpd.so")) {
 		isSkip = true
-		return "", fmt.Errorf("skip")
+		return Local{}, fmt.Errorf("skip")
 
 	} else if bytes.Contains(exe, util.Str2Bytes("smartctrl")) {
 		exe = util.Str2Bytes("/opt/WiseGrid/shell/smartctrl")
 	}
 
-	address := fileds[8]
+	address := fileds[9]
 	address = bytes.TrimPrefix(bytes.TrimSuffix(address, util.Str2Bytes("]")), util.Str2Bytes("["))
 	addr := string(address)
 
-	funcName, err := GetFuncName(string(exe), addr)
-	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "failed to get func name at %d:%s\n", l, err.Error())
-		return addr, err
-	}
-
-	return funcName, nil
+	return GetFuncName(string(exe), addr), nil
 }
 
 func ToFlameInput(f string) error {
@@ -151,7 +183,7 @@ func ToFlameInput(f string) error {
 	}()
 
 	var state bool
-	var stack []string
+	var stack []Local
 	var stackcn int
 	var allCost int
 
@@ -187,16 +219,16 @@ func ToFlameInput(f string) error {
 			}
 			state = false
 
-			if !isSkip {
-				_, _ = fmt.Fprintf(os.Stderr, "not have skip line at %d\n", l)
+			if isSkip {
+				_, _ = fmt.Fprintf(os.Stderr, "have skip line at %d\n", l)
 			}
 
 		} else if len(data) > 0 {
-			funcName, err := parseBacktrace(data)
+			local, err := parseBacktrace(data)
 			if err != nil {
 				continue
 			}
-			stack = append(stack, funcName)
+			stack = append(stack, local)
 		}
 	}
 
@@ -206,6 +238,9 @@ func ToFlameInput(f string) error {
 		return err
 	}
 	for k, v := range sample {
+		if one {
+			v = 1
+		}
 		in.WriteString(fmt.Sprintf("%s %d\n", k, v))
 	}
 	if err := util.Flamegraph(&in, util.DeleteExt(f)+".svg"); err != nil {
@@ -223,11 +258,13 @@ func ToFlameInput(f string) error {
 
 // 过滤进程号、过滤行号
 func main() {
+	flag.BoolVar(&display, "d", false, "display file line")
+	flag.BoolVar(&one, "o", false, "one sample")
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) <= 0 {
-		os.Exit(1)
+		flag.Usage()
 		return
 	}
 	tm := time.Now()

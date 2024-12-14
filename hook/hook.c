@@ -150,7 +150,7 @@ failed:
     fclose(fp);
 }
 
-static void
+void
 print_callers(int64_t value)
 {
     char   **symbols = NULL;
@@ -174,62 +174,14 @@ print_callers(int64_t value)
     debug_log_info("]: %ld", value);
 }
 
-static inline int64_t
-get_microsecond()
+static inline bool 
+has_prefix(const char *s, const char *prefix)
 {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-
-    return tv.tv_sec * 1000 * 1000 + tv.tv_usec;
+    size_t n = strlen(prefix);
+    return (strlen(s) >= n) && (0 == strncmp(s, prefix, n));
 }
 
 //gcc -fPIC -shared -o hook.so hook.c -ldl
-#if 0
-typedef int(*HOOK_SYSTEM)(const char*);
-
-
-int system(const char *cmd)
-{
-    static void *handle = NULL;
-    static HOOK_SYSTEM old_system = NULL;
-
-    if (!handle) {
-        handle = dlopen("libc.so.6", RTLD_LAZY);
-        old_system = (HOOK_SYSTEM)dlsym(handle, "system");
-    }
-    printf("oops!!! hack function invoked. cmd=<%s>\n", cmd);
-    if (NULL != strstr(cmd, "192.168.10.1") && NULL == strstr(cmd, "del")) {
-        abort();
-    }
-    return old_system(cmd);
-}
-
-//extern int poll (struct pollfd *__fds, nfds_t __nfds, int __timeout);
-
-typedef int(*HOOK_POLL)(struct pollfd *, nfds_t, int);
-
-int poll(struct pollfd *__fds, nfds_t __nfds, int __timeout)
-{
-    int32_t           rc;
-    int32_t           start;
-    int32_t           end;
-    static void      *handle = NULL;
-    static HOOK_POLL  old_poll = NULL;
-
-    if (!handle) {
-        handle = dlopen("libc.so.6", RTLD_LAZY);
-        old_poll = (HOOK_POLL)dlsym(handle, "poll");
-    }
-    
-    start = get_microsecond();
-    rc = old_poll(__fds, __nfds, __timeout);
-    end = get_microsecond();
-
-    print_callers(end - start);
-
-    return rc;
-}
-#endif
 
 static once_t g_once = ONCE_INIT();
 
@@ -237,34 +189,26 @@ static once_t g_once = ONCE_INIT();
 static void      *handle_libc = NULL;
 
 
-typedef int(*HOOK_OPEN)(const char *__file, int __oflag, ...);
+typedef int (*HOOK_system) (const char *__command);
 
 
-static HOOK_OPEN  open_old = NULL;
+static HOOK_system  open_system = NULL;
 
 
 static int32_t
 get_handle(void *data)
 {
     handle_libc = dlopen("libc.so.6", RTLD_LAZY);
-    open_old = (HOOK_OPEN)dlsym(handle_libc, "open");
+    open_system = (HOOK_system)dlsym(handle_libc, "system");
     return 0;
 }
 
-int open (const char *__file, int __oflag, ...)
+int system (const char *__command)
 {
-    int32_t rc;
-    va_list ap;
-
     once_do(&g_once, get_handle, NULL);
-
-
-    va_start(ap, __oflag);
-    rc = open_old(__file, __oflag, ap);
-    va_end(ap);
-
-    print_callers(1);
-
-    return rc;
+    if (has_prefix(__command, "iptables ")) {
+        debug_log_info("%s", __command);
+    }
+    //print_callers(1);
+    return open_system(__command);
 }
-

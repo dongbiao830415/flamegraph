@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -14,12 +15,33 @@ import (
 	"github.com/dongbiao830415/flamegraph/util"
 )
 
+var one bool
+
 var blockEnd = util.Str2Bytes("]:")
 
-func RenderSample(stack []string, cost int) string {
+var sample = make(map[string]int)
+
+func RenderSample(stack []string, cost int) {
+	var i int
+	for ; i < len(stack); i++ {
+		if stack[i] == "main" {
+			break
+		}
+	}
+	if i < len(stack) {
+		stack = stack[:i+1]
+	}
 	slices.Reverse(stack)
 	key := strings.Join(stack, ";")
-	return fmt.Sprintf("%s %d\n", key, cost)
+
+	allCost, ok := sample[key]
+	if !ok {
+		allCost = cost
+
+	} else {
+		allCost += cost
+	}
+	sample[key] = allCost
 }
 
 func ToFlameInput(f string) error {
@@ -64,7 +86,7 @@ func ToFlameInput(f string) error {
 			data = bytes.TrimSpace(bytes.TrimPrefix(data, blockEnd))
 			//栈结束了输出一条记录
 			if cost, err := strconv.Atoi(util.Bytes2Str(data)); err == nil {
-				in.WriteString(RenderSample(stack, cost))
+				RenderSample(stack, cost)
 				cn++
 				allCost += cost
 
@@ -87,6 +109,17 @@ func ToFlameInput(f string) error {
 		return err
 	}
 
+	if len(sample) <= 0 {
+		err = fmt.Errorf("too few stacks")
+		_, _ = fmt.Fprintf(os.Stderr, "%s\n", err.Error())
+		return err
+	}
+	for k, v := range sample {
+		if one {
+			v = 1
+		}
+		in.WriteString(fmt.Sprintf("%s %d\n", k, v))
+	}
 	if err := util.Flamegraph(&in, util.DeleteExt(f)+".svg"); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "%s\n", err.Error())
 		return err
@@ -100,9 +133,14 @@ func ToFlameInput(f string) error {
 
 // 过滤进程号、过滤行号
 func main() {
-	if len(os.Args) < 2 {
-		_, _ = fmt.Fprintf(os.Stderr, "usage: bpftrace_stack file\n")
+	flag.BoolVar(&one, "o", false, "one sample")
+	flag.Parse()
+
+	args := flag.Args()
+	if len(args) <= 0 {
+		flag.Usage()
 		return
 	}
-	_ = ToFlameInput(os.Args[1])
+
+	_ = ToFlameInput(args[0])
 }
